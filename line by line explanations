@@ -1,0 +1,246 @@
+#include "stm32f4xx.h"
+#include <stdint.h>
+#include <stdbool.h>
+
+// --- I2C LCD PARAMETERS ---
+#define I2C1_PORT I2C1           // I2C peripheral used
+#define LCD_ADDR (0x27 << 1)     // LCD I2C address (shifted for 7-bit)
+#define LCD_EN_PIN (1U << 2)     // Enable pin bit
+#define LCD_BL_PIN (1U << 3)     // Backlight pin bit
+#define LCD_RS_CMD 0              // RS = 0 for command
+#define LCD_RS_DATA (1U << 0)    // RS = 1 for data
+
+// --- IR SENSOR PARAMETER ---
+#define IR_PIN    (1U << 0)      // IR sensor connected to PA0
+#define IR_PORT   GPIOA
+
+// --- RESET BUTTON PARAMETER ---
+#define RESET_BTN_PIN (1U << 12) // Reset button on PC12
+#define RESET_BTN_PORT GPIOC
+
+// --- SERVO PARAMETERS (PC7 / TIM3_CH2) ---
+#define SERVO_PIN (1U << 7)      // Servo PWM pin
+#define SERVO_PORT GPIOC
+#define SERVO_TIM TIM3
+
+// Servo timing constants
+#define SERVO_PSC  15             // Timer prescaler: 1us per tick
+#define SERVO_ARR  19999          // Timer auto-reload: 20ms period
+#define SERVO_CLOSED_PULSE 1700   // PWM pulse for closed position
+#define SERVO_OPEN_PULSE   2200   // PWM pulse for open position
+
+// --- GLOBAL VARIABLES ---
+volatile int feed_count_remaining = 3; // Tracks remaining feedings
+volatile bool is_locked_out = false;   // Prevent multiple triggers from IR
+
+// =================================================================
+//                        UTILITY FUNCTIONS
+// =================================================================
+
+// Simple blocking delay in milliseconds
+void delay_ms(volatile uint32_t ms) {
+    for (uint32_t i = 0; i < ms * 3200; i++) __NOP(); // Do nothing
+}
+
+// Simple blocking delay in microseconds
+void delay_us(volatile uint32_t us) {
+    us *= 5; 
+    while (us--) __NOP();
+}
+
+// =================================================================
+//                      I2C LCD FUNCTIONS
+// =================================================================
+
+// Initialize I2C1 peripheral and GPIOs for SDA/SCL
+void I2C1_Init(void) {
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;   // Enable GPIOB clock
+    RCC->APB1ENR |= RCC_APB1ENR_I2C1EN;    // Enable I2C1 clock
+
+    // Configure PB8=SCL, PB9=SDA as alternate function open-drain
+    GPIOB->MODER = (GPIOB->MODER & ~(3U << 16 | 3U << 18)) | (2U << 16 | 2U << 18);
+    GPIOB->OTYPER |= (1U << 8) | (1U << 9); 
+    GPIOB->PUPDR = (GPIOB->PUPDR & ~(3U << 16 | 3U << 18)) | (1U << 16 | 1U << 18);
+
+    // Set alternate function 4 (I2C1)
+    GPIOB->AFR[1] = (GPIOB->AFR[1] & ~0xFF) | (4 << 0) | (4 << 4);
+
+    // Configure I2C peripheral
+    I2C1_PORT->CR1 &= ~I2C_CR1_PE;   // Disable before config
+    I2C1_PORT->CR2 = 16;             // 16 MHz peripheral clock
+    I2C1_PORT->CCR = 80;             // Clock control
+    I2C1_PORT->TRISE = 17;           // Max rise time
+    I2C1_PORT->CR1 |= I2C_CR1_PE;    // Enable I2C
+}
+
+// Robust I2C write (with timeout)
+uint8_t i2c_write_robust(uint8_t address, uint8_t data) {
+    I2C1_PORT->CR1 |= I2C_CR1_START;    // Send start
+    uint32_t timeout = 0xFFFFF;
+    while (!(I2C1_PORT->SR1 & I2C_SR1_SB) && timeout--) if(timeout==0) return 0;
+
+    I2C1_PORT->DR = address;            // Send address
+    timeout = 0xFFFFF;
+    while (!(I2C1_PORT->SR1 & I2C_SR1_ADDR) && timeout--) if(timeout==0) return 0;
+    (void)I2C1_PORT->SR2;               // Clear ADDR flag
+
+    I2C1_PORT->DR = data;               // Send data
+    timeout = 0xFFFFF;
+    while (!(I2C1_PORT->SR1 & I2C_SR1_BTF) && timeout--) if(timeout==0) return 0;
+
+    I2C1_PORT->CR1 |= I2C_CR1_STOP;     // Send stop
+    return 1;
+}
+
+// Send 4-bit nibble to LCD
+void lcd_send_nibble(uint8_t nibble, uint8_t mode) {
+    uint8_t data = nibble | mode | LCD_BL_PIN; 
+    i2c_write_robust(LCD_ADDR, data | LCD_EN_PIN);  // EN high
+    delay_us(100); 
+    i2c_write_robust(LCD_ADDR, data & ~LCD_EN_PIN); // EN low
+    delay_us(100); 
+}
+
+// Send full byte command to LCD
+void lcd_send_cmd(uint8_t cmd) {
+    lcd_send_nibble(cmd & 0xF0, LCD_RS_CMD);
+    lcd_send_nibble((cmd << 4) & 0xF0, LCD_RS_CMD);
+}
+
+// Send data (character) to LCD
+void lcd_send_data(uint8_t data) {
+    lcd_send_nibble(data & 0xF0, LCD_RS_DATA);
+    lcd_send_nibble((data << 4) & 0xF0, LCD_RS_DATA);
+}
+
+// Initialize LCD
+void lcd_init(void) {
+    delay_ms(300); 
+    lcd_send_nibble(0x30, LCD_RS_CMD); delay_ms(5); 
+    lcd_send_nibble(0x30, LCD_RS_CMD); delay_us(100); 
+    lcd_send_nibble(0x30, LCD_RS_CMD); delay_us(100); 
+    lcd_send_nibble(0x20, LCD_RS_CMD); delay_us(100); 
+    lcd_send_cmd(0x28);  // 4-bit mode, 2 lines
+    lcd_send_cmd(0x08);  // Display off
+    lcd_send_cmd(0x01); delay_ms(2); // Clear display
+    lcd_send_cmd(0x06);  // Entry mode
+    lcd_send_cmd(0x0C);  // Display on
+}
+
+// Set cursor position
+void lcd_set_cursor(uint8_t row, uint8_t col) {
+    lcd_send_cmd((row ? 0xC0 : 0x80) + col);
+}
+
+// Print string to LCD
+void lcd_print_string(char *str) {
+    while (*str) lcd_send_data((uint8_t)*str++);
+}
+
+// Update LCD with feed count
+void update_lcd_display(void) {
+    lcd_set_cursor(0,0);
+    lcd_print_string("Cat Feeder Count");
+    lcd_set_cursor(1,0);
+    if(feed_count_remaining > 0) {
+        lcd_print_string("Left: ");
+        lcd_send_data('0' + feed_count_remaining); // display number
+        lcd_print_string(" times    ");
+    } else {
+        lcd_print_string("LIMIT REACHED!  ");
+    }
+}
+
+// =================================================================
+//                      SERVO & GPIO CONTROL
+// =================================================================
+
+// Initialize servo PWM on TIM3_CH2 (PC7)
+void Servo_Init(void) {
+    RCC->APB1ENR |= RCC_APB1ENR_TIM3EN; // Enable TIM3
+
+    // Set PC7 to alternate function
+    SERVO_PORT->MODER = (SERVO_PORT->MODER & ~(3U << 14)) | (2U << 14);
+    SERVO_PORT->AFR[0] = (SERVO_PORT->AFR[0] & ~(0xF << 28)) | (2 << 28);
+
+    SERVO_TIM->PSC = SERVO_PSC; 
+    SERVO_TIM->ARR = SERVO_ARR; 
+    SERVO_TIM->CCMR1 |= (6U << 12) | TIM_CCMR1_OC2PE; // PWM mode 1
+    SERVO_TIM->CCER |= TIM_CCER_CC2E;                // Enable output
+    SERVO_TIM->CR1 |= TIM_CR1_CEN;                   // Start timer
+}
+
+// Open servo, wait 400ms, then close
+void dispense_food(void) {
+    SERVO_TIM->CCR2 = SERVO_OPEN_PULSE; 
+    delay_ms(400); // Allow servo to rotate
+    SERVO_TIM->CCR2 = SERVO_CLOSED_PULSE; 
+}
+
+// Initialize IR sensor and reset button GPIOs
+void GPIO_Sensors_Init(void) {
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOCEN;
+
+    IR_PORT->MODER &= ~IR_PIN;           // PA0 input
+    RESET_BTN_PORT->MODER &= ~RESET_BTN_PIN; 
+    RESET_BTN_PORT->PUPDR &= ~RESET_BTN_PIN;
+    RESET_BTN_PORT->PUPDR |= (1U << 24); // PC12 pull-up
+}
+
+// =================================================================
+//                      INTERRUPT LOGIC
+// =================================================================
+
+// Configure EXTI12 interrupt for PC12 (reset button)
+void Reset_Button_EXTI_Init(void) {
+    RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;      // Enable SYSCFG
+
+    SYSCFG->EXTICR[3] &= ~(0xF << 0);
+    SYSCFG->EXTICR[3] |= (0x2 << 0);           // Map PC12 -> EXTI12
+
+    EXTI->IMR |= (1U << 12);                   // Unmask EXTI12
+    EXTI->FTSR |= (1U << 12);                  // Trigger on falling edge
+    EXTI->RTSR &= ~(1U << 12);                 // Disable rising edge
+
+    NVIC_EnableIRQ(EXTI15_10_IRQn);            // Enable NVIC interrupt
+}
+
+// EXTI interrupt handler for PC12
+void EXTI15_10_IRQHandler(void) {
+    if (EXTI->PR & (1U << 12)) {             // Check if EXTI12 triggered
+        EXTI->PR = (1U << 12);               // Clear pending flag
+        feed_count_remaining = 3;            // Reset feed count
+        update_lcd_display();                // Update LCD immediately
+    }
+}
+
+// =================================================================
+//                          MAIN LOOP
+// =================================================================
+
+int main(void) {
+    GPIO_Sensors_Init();       // Initialize IR and button GPIOs
+    Reset_Button_EXTI_Init();  // Enable reset button interrupt
+    Servo_Init();              // Initialize servo PWM
+    I2C1_Init();               // Initialize I2C1
+    lcd_init();                // Initialize LCD
+
+    SERVO_TIM->CCR2 = SERVO_CLOSED_PULSE; // Start with servo closed
+    update_lcd_display();                  // Display initial count
+
+    while(1) {
+        // Poll IR sensor
+        if(!(IR_PORT->IDR & IR_PIN)) { // IR sensor triggered (active low)
+            if(feed_count_remaining > 0 && !is_locked_out) {
+                feed_count_remaining--; // Decrement feed count
+                is_locked_out = true;  // Lock to prevent multiple triggers
+                dispense_food();       // Move servo to dispense
+                update_lcd_display();  // Update LCD
+                delay_ms(500);         // Small delay for sensor stability
+            }
+        } else {
+            is_locked_out = false; // Reset lock when sensor is clear
+        }
+        delay_ms(50); // Polling interval
+    }
+}

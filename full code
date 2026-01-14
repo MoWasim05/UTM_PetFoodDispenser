@@ -1,0 +1,255 @@
+#include "stm32f4xx.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+// --- I2C LCD PARAMETERS ---
+#define I2C1_PORT I2C1
+#define LCD_ADDR (0x27 << 1) 
+#define LCD_EN_PIN (1U << 2) 
+#define LCD_BL_PIN (1U << 3) 
+#define LCD_RS_CMD 0 
+#define LCD_RS_DATA (1U << 0) 
+
+// --- IR SENSOR PARAMETER ---
+#define IR_PIN    (1U << 0)
+#define IR_PORT   GPIOA
+
+// --- RESET BUTTON PARAMETER ---
+#define RESET_BTN_PIN (1U << 12)
+#define RESET_BTN_PORT GPIOC 
+
+// --- SERVO PARAMETERS (PC7 / TIM3_CH2) ---
+#define SERVO_PIN (1U << 7)
+#define SERVO_PORT GPIOC
+#define SERVO_TIM TIM3
+
+// 16MHz Clock Settings:
+#define SERVO_PSC  15    // 1us per tick
+#define SERVO_ARR  19999 // 20ms period
+
+// --- ANGLE CALIBRATION ---
+#define SERVO_CLOSED_PULSE 1700
+#define SERVO_OPEN_PULSE   2200
+
+// --- GLOBAL COUNTER ---
+volatile int feed_count_remaining = 3; 
+volatile bool is_locked_out = false; 
+
+
+// =================================================================
+//                      DELAY FUNCTIONS
+// =================================================================
+
+void delay_ms(volatile uint32_t ms) {
+    for (uint32_t i = 0; i < ms * 3200; i++) {
+        __NOP();
+    }
+}
+
+void delay_us(volatile uint32_t us) {
+    us *= 5; 
+    while (us--) __NOP();
+}
+
+
+// =================================================================
+//                      I2C LCD FUNCTIONS
+// =================================================================
+
+void I2C1_Init(void) {
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;
+    RCC->APB1ENR |= RCC_APB1ENR_I2C1EN;
+
+    GPIOB->MODER &= ~(3U << 16 | 3U << 18);
+    GPIOB->MODER |= (2U << 16 | 2U << 18);
+    GPIOB->OTYPER |= (1U << 8) | (1U << 9);
+    GPIOB->PUPDR &= ~(3U << 16 | 3U << 18);
+    GPIOB->PUPDR |= (1U << 16 | 1U << 18);
+
+    GPIOB->AFR[1] &= ~(0xF << (4 * 0)); 
+    GPIOB->AFR[1] &= ~(0xF << (4 * 1)); 
+    GPIOB->AFR[1] |= (4U << (4 * 0));
+    GPIOB->AFR[1] |= (4U << (4 * 1));
+    
+    I2C1_PORT->CR1 &= ~I2C_CR1_PE; 
+    I2C1_PORT->CR2 = 16; 
+    I2C1_PORT->CCR = 80; 
+    I2C1_PORT->TRISE = 17; 
+    I2C1_PORT->CR1 |= I2C_CR1_PE; 
+}
+
+uint8_t i2c_write_robust(uint8_t address, uint8_t data) {
+    I2C1_PORT->CR1 |= I2C_CR1_START;
+    uint32_t timeout = 0xFFFFF;
+    while (!(I2C1_PORT->SR1 & I2C_SR1_SB) && (timeout-- > 0)); 
+    if(timeout == 0) return 0;
+
+    I2C1_PORT->DR = address;
+    timeout = 0xFFFFF;
+    while (!(I2C1_PORT->SR1 & I2C_SR1_ADDR) && (timeout-- > 0)); 
+    if(timeout == 0) return 0;
+    (void)I2C1_PORT->SR2;
+
+    I2C1_PORT->DR = data;
+    timeout = 0xFFFFF;
+    while (!(I2C1_PORT->SR1 & I2C_SR1_BTF) && (timeout-- > 0)); 
+    if(timeout == 0) return 0;
+
+    I2C1_PORT->CR1 |= I2C_CR1_STOP;
+    return 1;
+}
+
+void lcd_send_nibble(uint8_t nibble, uint8_t mode) {
+    uint8_t data = nibble | mode | LCD_BL_PIN; 
+    i2c_write_robust(LCD_ADDR, data | LCD_EN_PIN);
+    delay_us(100); 
+    i2c_write_robust(LCD_ADDR, data & ~LCD_EN_PIN);
+    delay_us(100); 
+}
+
+void lcd_send_cmd(uint8_t cmd) {
+    uint8_t high_nibble = cmd & 0xF0;
+    uint8_t low_nibble = (cmd << 4) & 0xF0;
+    lcd_send_nibble(high_nibble, LCD_RS_CMD);
+    lcd_send_nibble(low_nibble, LCD_RS_CMD);
+}
+
+void lcd_send_data(uint8_t data) {
+    uint8_t high_nibble = data & 0xF0;
+    uint8_t low_nibble = (data << 4) & 0xF0;
+    lcd_send_nibble(high_nibble, LCD_RS_DATA);
+    lcd_send_nibble(low_nibble, LCD_RS_DATA);
+}
+
+void lcd_init(void) {
+    delay_ms(300); 
+    lcd_send_nibble(0x30, LCD_RS_CMD); delay_ms(5); 
+    lcd_send_nibble(0x30, LCD_RS_CMD); delay_us(100); 
+    lcd_send_nibble(0x30, LCD_RS_CMD); delay_us(100); 
+    lcd_send_nibble(0x20, LCD_RS_CMD); delay_us(100); 
+    lcd_send_cmd(0x28); 
+    lcd_send_cmd(0x08); 
+    lcd_send_cmd(0x01); delay_ms(2); 
+    lcd_send_cmd(0x06); 
+    lcd_send_cmd(0x0C); 
+}
+
+void lcd_set_cursor(uint8_t row, uint8_t col) {
+    uint8_t cmd;
+    cmd = (row == 0) ? (0x80 + col) : (0xC0 + col);
+    lcd_send_cmd(cmd);
+}
+
+void lcd_print_string(char *str) {
+    while (*str) {
+        lcd_send_data((uint8_t)*str++);
+    }
+}
+
+
+// =================================================================
+//                      SERVO CONTROL
+// =================================================================
+
+void set_servo_pulse(uint16_t pulse_us) {
+    SERVO_TIM->CCR2 = pulse_us; 
+}
+
+void Servo_Init(void) {
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
+    RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
+
+    SERVO_PORT->MODER &= ~(3U << 14); 
+    SERVO_PORT->MODER |= (2U << 14); 
+
+    SERVO_PORT->AFR[0] &= ~(0xF << 28); 
+    SERVO_PORT->AFR[0] |= (2U << 28);   
+
+    SERVO_TIM->PSC = SERVO_PSC; 
+    SERVO_TIM->ARR = SERVO_ARR; 
+
+    SERVO_TIM->CCMR1 &= ~(TIM_CCMR1_OC2M); 
+    SERVO_TIM->CCMR1 |= (6U << 12); 
+    SERVO_TIM->CCMR1 |= TIM_CCMR1_OC2PE; 
+
+    SERVO_TIM->CCER |= TIM_CCER_CC2E;
+    SERVO_TIM->BDTR |= TIM_BDTR_MOE;
+    SERVO_TIM->CR1 |= TIM_CR1_CEN;
+}
+
+void dispense_food(void) {
+    set_servo_pulse(SERVO_OPEN_PULSE); 
+    delay_ms(400);                  // updated: 400 ms
+
+    set_servo_pulse(SERVO_CLOSED_PULSE); 
+    // delay removed here
+}
+
+
+// =================================================================
+//                      MAIN LOGIC
+// =================================================================
+
+int check_ir_state(void) {
+    if (!(IR_PORT->IDR & IR_PIN)) return 1; 
+    else return 0; 
+}
+
+void GPIO_Sensors_Init(void) {
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOCEN;
+
+    IR_PORT->MODER &= ~(3U << 0);
+    
+    RESET_BTN_PORT->MODER &= ~(3U << 24); 
+    RESET_BTN_PORT->PUPDR &= ~(3U << 24); 
+    RESET_BTN_PORT->PUPDR |= (1U << 24); 
+}
+
+void update_lcd_display(void) {
+    char buffer[17]; 
+    lcd_set_cursor(0, 0);
+    lcd_print_string("Cat Feeder Count");
+    lcd_set_cursor(1, 0);
+    if (feed_count_remaining > 0) {
+        sprintf(buffer, "Left: %d times   ", feed_count_remaining);
+    } else {
+        sprintf(buffer, "LIMIT REACHED!  ");
+    }
+    lcd_print_string(buffer);
+}
+
+int main(void) {
+    GPIO_Sensors_Init();
+    Servo_Init(); 
+    I2C1_Init();
+    lcd_init();
+
+    set_servo_pulse(SERVO_CLOSED_PULSE);
+    update_lcd_display(); 
+
+    while (1) {
+        if (check_ir_state()) {
+            if (feed_count_remaining > 0 && !is_locked_out) {
+                feed_count_remaining--; 
+                is_locked_out = true; 
+                
+                dispense_food(); 
+                update_lcd_display(); 
+                delay_ms(500); 
+            }
+        } else {
+            if (is_locked_out) is_locked_out = false;
+        }
+        
+        if (!(RESET_BTN_PORT->IDR & RESET_BTN_PIN)) {
+            if (feed_count_remaining != 3) {
+                feed_count_remaining = 3; 
+                update_lcd_display(); 
+            }
+            delay_ms(100);
+            while (!(RESET_BTN_PORT->IDR & RESET_BTN_PIN)) {} 
+        }
+        delay_ms(50); 
+    }
+}
